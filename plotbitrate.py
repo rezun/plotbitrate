@@ -33,6 +33,7 @@ __version__ = "1.0.5"
 
 import argparse
 import csv
+import dataclasses
 import datetime
 import math
 import multiprocessing
@@ -40,9 +41,8 @@ import shutil
 import statistics
 import subprocess
 import sys
-import dataclasses
-from collections import OrderedDict
 from enum import Enum
+from threading import Thread, Lock
 from typing import Callable, Union, List, IO, Iterable, Optional, Dict, Tuple, \
     Generator
 
@@ -56,6 +56,7 @@ except ImportError:
 try:
     import matplotlib.pyplot as matplot  # type: ignore
     import matplotlib  # type: ignore
+    import matplotlib.animation as animation  # type: ignore
 except ImportError:
     sys.exit("Error: Missing package 'python3-matplotlib'")
 
@@ -511,26 +512,114 @@ def add_stacked_areas(
 
 
 def add_area(
-        frames: Iterable[Frame],
+        frames_source: Iterable[Frame],
         duration: int,
         downscale: bool,
         max_display_values: int,
         stream_type: str
 ) -> Tuple[int, int]:
-    bitrates = dict(frames_to_kbits(frames, 0, duration))
-    bitrate_max = max(bitrates.values())
-    bitrate_mean = int(statistics.mean(bitrates.values()))
+    bitrates_source = frames_to_kbits(frames_source, 0, duration)
+    bitrates: Dict[int, int] = {}
+    plot_line = None
+    plot_area = None
+    stop_frame_reader = False
+    frame_reader_done = False
+    stop_animation = False
+    lock = Lock()
 
-    if downscale and 0 < max_display_values < duration:
-        factor = duration // max_display_values
-        bitrates = dict(downscale_bitrate(bitrates, factor))
-
-    seconds = list(bitrates.keys())
-    values = list(bitrates.values())
     color = Color.AUDIO.value if stream_type == "audio" else Color.FRAME.value
-    matplot.plot(seconds, values, linewidth=0.5, color=color)
-    matplot.fill_between(seconds, 0, values, linewidth=0.5, color=color)
-    return bitrate_max, bitrate_mean
+
+    def frame_reader():
+        nonlocal frame_reader_done
+        buffer = {}
+
+        def write_buffer():
+            lock.acquire()
+            bitrates.update(buffer)
+            buffer.clear()
+            lock.release()
+
+        for second, value in bitrates_source:
+            if stop_frame_reader:
+                break
+            buffer[second] = value
+            if second % 10 == 0:
+                write_buffer()
+        
+        write_buffer()
+        frame_reader_done = True
+
+    def animate(_):
+        nonlocal stop_animation
+        nonlocal plot_line
+        nonlocal plot_area
+
+        # clear graphs only
+        if plot_line and plot_area:
+            plot_line.remove()
+            plot_area.remove()
+
+        # get all read values and plot them
+        lock.acquire()
+        items = list(bitrates.items())
+        lock.release()
+        if items:
+            seconds, values = zip(*items)
+            plot_line = matplot.plot(
+                seconds, values, linewidth=0.5, color=color
+            )[0]
+            plot_area = matplot.fill_between(
+                seconds, 0, values, linewidth=0.5, color=color
+            )
+            matplot.xticks(range(0, duration + 1, max(duration // 10, 1)))
+
+        if stop_animation:
+            plot_animation._stop()
+            peak = max(values)
+            mean = int(statistics.mean(values))
+            draw_horizontal_line_with_text(
+                pos_y=peak,
+                pos_h_percent=0.08,
+                text="peak ({:,})".format(peak)
+            )
+            draw_horizontal_line_with_text(
+                pos_y=mean,
+                pos_h_percent=0.92,
+                text="mean ({:,})".format(mean)
+            )
+
+        # no more data: flag to stop animation
+        # must be stopped on next animation,
+        # otherwise this loop will not be plotted
+        if frame_reader_done:
+            stop_animation = True
+
+    thread = Thread(target=frame_reader)
+    thread.start()
+
+    plot_animation = animation.FuncAnimation(
+        matplot.gcf(), animate, interval=1000
+    )
+    matplot.show()
+    stop_frame_reader = True
+    thread.join()
+
+    sys.exit(0)
+
+    # bitrates = dict(frames_to_kbits(frames_source, 0, duration))
+    # bitrate_max = max(bitrates.values())
+    # bitrate_mean = int(statistics.mean(bitrates.values()))
+
+    # if downscale and 0 < max_display_values < duration:
+    #     factor = duration // max_display_values
+    #     bitrates = dict(downscale_bitrate(bitrates, factor))
+    #
+    # seconds = list(bitrates.keys())
+    # values = list(bitrates.values())
+    # color = Color.AUDIO.value if stream_type == "audio" else Color.FRAME.value
+    # matplot.plot(seconds, values, linewidth=0.5, color=color)
+    # matplot.fill_between(seconds, 0, values, linewidth=0.5, color=color)
+    # return bitrate_max, bitrate_mean
 
 
 def draw_horizontal_line_with_text(
